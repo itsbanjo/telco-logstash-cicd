@@ -1,0 +1,169 @@
+# ============================================================================
+# TelcoNZ SNMP Pipeline: <%= pipeline_name.upcase %>
+# Description: <%= pipeline_config['description'] %>
+# Devices: <%= pipeline_config['device_count'] %>
+# Interval: <%= pipeline_config['interval'] %>s
+# Generated: <%= Time.now.strftime('%Y-%m-%d %H:%M:%S') %>
+# ============================================================================
+# DO NOT EDIT - This file is auto-generated from telconz-snmp-config.yml
+# Regenerate with: ruby generate-snmp-pipelines.rb
+# ============================================================================
+
+input {
+  snmp {
+    # Host definitions for this pipeline
+    hosts => [
+<% pipeline_config['devices'].each_with_index do |device, idx| -%>
+      {
+        host => "udp:<%= device['ip'] %>/161"
+        community => "${SNMP_COMMUNITY:public}"
+        version => "2c"
+        retries => 2
+        timeout => 2000
+      }<%= idx < pipeline_config['devices'].length - 1 ? ',' : '' %>
+<% end -%>
+    ]
+    
+    interval => <%= pipeline_config['interval'] %>
+    
+    # Common OIDs for all devices
+    get => [
+      "1.3.6.1.2.1.1.1.0",    # sysDescr
+      "1.3.6.1.2.1.1.3.0",    # sysUpTime
+      "1.3.6.1.2.1.1.5.0",    # sysName
+      "1.3.6.1.2.1.1.6.0"     # sysLocation
+    ]
+    
+    walk => [
+      # Interface statistics
+      "1.3.6.1.2.1.2.2.1.2",      # ifDescr
+      "1.3.6.1.2.1.2.2.1.8",      # ifOperStatus
+      "1.3.6.1.2.1.2.2.1.10",     # ifInOctets
+      "1.3.6.1.2.1.2.2.1.16",     # ifOutOctets
+      
+      # CDP Neighbor Discovery
+      "1.3.6.1.4.1.9.9.23.1.2.1.1.4",   # cdpCacheAddress
+      "1.3.6.1.4.1.9.9.23.1.2.1.1.6",   # cdpCacheDeviceId
+      "1.3.6.1.4.1.9.9.23.1.2.1.1.7",   # cdpCacheDevicePort
+      "1.3.6.1.4.1.9.9.23.1.2.1.1.8",   # cdpCachePlatform
+      
+      # LLDP Neighbor Discovery
+      "1.0.8802.1.1.2.1.4.1.1.5",       # lldpRemChassisId
+      "1.0.8802.1.1.2.1.4.1.1.7",       # lldpRemPortId
+      "1.0.8802.1.1.2.1.4.1.1.9",       # lldpRemSysName
+      "1.0.8802.1.1.2.1.4.1.1.10"       # lldpRemSysDesc
+    ]
+    
+    add_field => {
+      "[@metadata][pipeline]" => "<%= pipeline_name %>"
+      "[telconz][pipeline]" => "<%= pipeline_name %>"
+    }
+  }
+}
+
+filter {
+  # Enrich with device metadata from config
+  ruby {
+    init => '
+      require "yaml"
+      
+      # Device lookup table - loaded once at pipeline start
+      @@device_lookup = {
+<% pipeline_config['devices'].each do |device| -%>
+        "<%= device['ip'] %>" => {
+          "hostname" => "<%= device['hostname'] %>",
+          "region" => "<%= device['region'] %>",
+          "tier" => "<%= device['tier'] %>",
+          "type" => "<%= device['type'] %>",
+          "domain" => "<%= device['domain'] %>",
+          "vendor" => "<%= device['vendor'] %>",
+          "model" => "<%= device['model'] %>"
+        },
+<% end -%>
+      }
+    '
+    code => '
+      # Extract source IP from host field
+      host_field = event.get("[host]")
+      source_ip = nil
+      
+      if host_field.is_a?(String)
+        # Format: "udp:10.1.2.3/161" or just IP
+        if match = host_field.match(/(\d+\.\d+\.\d+\.\d+)/)
+          source_ip = match[1]
+        end
+      elsif host_field.is_a?(Hash) && host_field["ip"]
+        source_ip = host_field["ip"].is_a?(Array) ? host_field["ip"].first : host_field["ip"]
+      end
+      
+      if source_ip && @@device_lookup[source_ip]
+        device = @@device_lookup[source_ip]
+        
+        # Set host fields (ECS compliant)
+        event.set("[host][name]", device["hostname"])
+        event.set("[host][ip]", [source_ip])
+        event.set("[host][type]", device["type"])
+        
+        # Set TelcoNZ custom fields
+        event.set("[telconz][device][hostname]", device["hostname"])
+        event.set("[telconz][device][ip]", source_ip)
+        event.set("[telconz][device][region]", device["region"])
+        event.set("[telconz][device][tier]", device["tier"])
+        event.set("[telconz][device][type]", device["type"])
+        event.set("[telconz][device][domain]", device["domain"])
+        event.set("[telconz][device][vendor]", device["vendor"])
+        event.set("[telconz][device][model]", device["model"])
+        
+        # Set observer fields (for network monitoring)
+        event.set("[observer][name]", device["hostname"])
+        event.set("[observer][type]", device["type"].downcase)
+        event.set("[observer][vendor]", device["vendor"])
+        event.set("[observer][product]", device["model"])
+        event.set("[observer][geo][name]", device["region"])
+      else
+        # Unknown device - log warning
+        event.set("[host][name]", "unknown-#{source_ip}")
+        event.tag("_unknown_device")
+      end
+    '
+  }
+  
+  # Parse sysUpTime to human-readable format
+  if [iso.org.dod.internet.mgmt.mib-2.system.sysUpTime.0] {
+    ruby {
+      code => '
+        ticks = event.get("[iso.org.dod.internet.mgmt.mib-2.system.sysUpTime.0]").to_i
+        seconds = ticks / 100
+        days = seconds / 86400
+        hours = (seconds % 86400) / 3600
+        minutes = (seconds % 3600) / 60
+        
+        event.set("[telconz][uptime][seconds]", seconds)
+        event.set("[telconz][uptime][days]", days)
+        event.set("[telconz][uptime][formatted]", "#{days}d #{hours}h #{minutes}m")
+      '
+    }
+  }
+  
+  # Add standard tags
+  mutate {
+    add_tag => ["snmp", "telconz", "<%= pipeline_name %>", "network"]
+    remove_field => ["host"]  # Remove original host field, we've set [host][name]
+  }
+}
+
+output {
+  elasticsearch {
+    cloud_id => "${ELASTIC_CLOUD_ID}"
+    api_key => "${ELASTIC_API_KEY}"
+    
+    # Data stream naming: logs-telconz.snmp.<pipeline>-default
+    data_stream => true
+    data_stream_type => "logs"
+    data_stream_dataset => "telconz.snmp.<%= pipeline_name %>"
+    data_stream_namespace => "production"
+  }
+  
+  # Debug output (comment out in production)
+  # stdout { codec => rubydebug }
+}
